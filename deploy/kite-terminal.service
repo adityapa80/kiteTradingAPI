@@ -1,0 +1,29 @@
+[Unit]
+Description=Kite Terminal (Zerodha trading web interface)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=kite
+Group=kite
+WorkingDirectory=/opt/kite-terminal
+ExecStart=/opt/kite-terminal/.venv/bin/python app.py
+Environment=PYTHONUNBUFFERED=1
+Restart=always
+RestartSec=3
+
+# Hardening: the app only needs to write its data/ folder.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/kite-terminal/data
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+
+[Install]
+WantedBy=multi-user.target
