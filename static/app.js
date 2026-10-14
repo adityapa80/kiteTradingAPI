@@ -6,7 +6,7 @@ const INDICES = [
   { key: 'NSE:NIFTY BANK', label: 'BANK NIFTY' },
   { key: 'BSE:SENSEX', label: 'SENSEX' },
 ];
-const DEFAULT_WATCH = ['NSE:RELIANCE', 'NSE:INFY', 'NSE:TCS', 'NSE:HDFCBANK', 'NSE:ICICIBANK', 'NSE:SBIN', 'NSE:TATAMOTORS'];
+const DEFAULT_WATCH = ['NSE:RELIANCE', 'NSE:INFY', 'NSE:TCS', 'NSE:HDFCBANK', 'NSE:ICICIBANK', 'NSE:SBIN'];
 const LIST_COUNT = 5;
 const LIST_MAX = 50;
 const MODIFIABLE = new Set(['OPEN', 'TRIGGER PENDING', 'AMO REQ RECEIVED']);
@@ -143,6 +143,7 @@ async function api(path, opts = {}) {
   if (!res.ok) {
     const err = new Error(data.error || 'Request failed');
     err.type = data.error_type;
+    err.status = res.status;
     if (data.error_type === 'TokenException' && S.loggedIn) {
       toast('error', 'Session expired', 'Please log in to Kite again.');
       showLogin();
@@ -307,6 +308,10 @@ function wantedKeys() {
 
 // Prices arrive over the live stream; REST polling is only the fallback when it is down.
 async function refreshQuotes() {
+  // Watchdog: the server sends something at least every 15 s. A stream that has gone
+  // silent (a half-dead connection after a network blip) is reopened instead of
+  // leaving prices frozen.
+  if (LIVE.connected && Date.now() - LIVE.lastMsg > 40000) startStream();
   if (LIVE.connected) { syncStreamKeys(); return; }
   if (quoteInFlight) return;
   const wait = 1050 - (Date.now() - lastQuoteAt); // Kite allows ~1 quote request / second
@@ -332,7 +337,7 @@ const quotesSoon = debounce(() => refreshQuotes().catch(() => {}), 120);
 /* ============================================================ live stream */
 // The server keeps one Kite WebSocket and pushes ticks here over Server-Sent
 // Events (~20 batches/s). Order postbacks arrive on the same stream.
-const LIVE = { es: null, cid: Math.random().toString(36).slice(2, 12), connected: false, sig: '', status: 'off', retry: null };
+const LIVE = { es: null, cid: Math.random().toString(36).slice(2, 12), connected: false, sig: '', status: 'off', retry: null, lastMsg: 0 };
 
 function setLiveStatus(status) {
   LIVE.status = status;
@@ -350,10 +355,12 @@ function startStream() {
   if (!window.EventSource) return;
   const es = new EventSource(`/api/stream?cid=${LIVE.cid}`);
   LIVE.es = es;
-  es.onopen = () => { LIVE.connected = true; LIVE.sig = ''; syncStreamKeys(); setLiveStatus(LIVE.status); };
-  es.addEventListener('status', (e) => setLiveStatus(JSON.parse(e.data).status));
-  es.addEventListener('ticks', (e) => onTicks(JSON.parse(e.data)));
-  es.addEventListener('order', () => ordersSoon());
+  const seen = () => { LIVE.lastMsg = Date.now(); };
+  es.onopen = () => { seen(); LIVE.connected = true; LIVE.sig = ''; syncStreamKeys(); setLiveStatus(LIVE.status); };
+  es.addEventListener('ping', seen);
+  es.addEventListener('status', (e) => { seen(); setLiveStatus(JSON.parse(e.data).status); });
+  es.addEventListener('ticks', (e) => { seen(); onTicks(JSON.parse(e.data)); });
+  es.addEventListener('order', () => { seen(); ordersSoon(); });
   es.onerror = () => { LIVE.connected = false; setLiveStatus('off'); }; // EventSource retries on its own
 }
 
@@ -380,8 +387,9 @@ async function syncStreamKeys() {
   LIVE.sig = sig;
   try {
     await api('/stream/subscribe', { method: 'POST', body: { cid: LIVE.cid, keys, depth } });
-  } catch {
-    LIVE.sig = ''; // stream not registered yet / server restarted: retry on next sync
+  } catch (e) {
+    LIVE.sig = ''; // retry on next sync
+    if (e.status === 404) startStream(); // the server no longer knows this stream: reopen it
   }
 }
 
@@ -476,13 +484,21 @@ function notifyOrder(o, prev) {
   else if (o.status === 'CANCELLED' && prev) toast('info', `${what} cancelled`, `Order #${o.order_id}`);
 }
 
+// Every watchlist item is checked against today's instrument master: details are refreshed,
+// and symbols Kite no longer lists (renamed after a corporate action, delisted, expired)
+// are flagged instead of silently showing no price.
+S.notListed = new Set();
 async function hydrateLists() {
-  const missing = new Set();
-  S.lists.flat().forEach((it) => { if (!it.instrument_token || !it.segment) missing.add(it.key); });
-  if (S.chart.inst && !S.chart.inst.instrument_token) missing.add(S.chart.inst.key);
-  if (!missing.size) return;
+  const keys = new Set(S.lists.flat().map((it) => it.key));
+  if (S.chart.inst) keys.add(S.chart.inst.key);
+  if (!keys.size) return;
   try {
-    const found = await api('/instruments/lookup?' + [...missing].map((k) => 'i=' + encodeURIComponent(k)).join('&'));
+    const all = [...keys];
+    const found = {};
+    for (let i = 0; i < all.length; i += 200) { // the lookup endpoint takes 200 keys at a time
+      Object.assign(found, await api('/instruments/lookup?' + all.slice(i, i + 200).map((k) => 'i=' + encodeURIComponent(k)).join('&')));
+    }
+    S.notListed = new Set(all.filter((k) => !found[k]));
     S.lists = S.lists.map((l) => l.map((it) => (found[it.key] ? { ...it, ...slim(found[it.key]) } : it)));
     if (S.chart.inst && found[S.chart.inst.key]) S.chart.inst = { ...S.chart.inst, ...slim(found[S.chart.inst.key]) };
     saveLists();
@@ -540,7 +556,9 @@ function renderWatchlist() {
   $('#watchlist').innerHTML = list.map((it, idx) => `
     <div class="wl-row${idx === S.selected ? ' selected' : ''}" data-idx="${idx}">
       <div class="wl-main">
-        <div class="wl-sym"><span class="sym">${esc(it.tradingsymbol)}</span><span class="sub">${esc(subLabel(it))}</span></div>
+        <div class="wl-sym"><span class="sym">${esc(it.tradingsymbol)}</span>${S.notListed.has(it.key)
+          ? `<span class="sub warn" title="Kite's instrument list for today has no ${esc(it.key)}. The symbol was probably renamed (e.g. after a demerger) or delisted. Remove it and search for the company again.">Not listed at Kite today · renamed?</span>`
+          : `<span class="sub">${esc(subLabel(it))}</span>`}</div>
         <div class="wl-px"><span class="ltp num">—</span><span class="chg num">&nbsp;</span></div>
         <div class="wl-actions">
           ${isIndex(it) ? '' : '<button class="mini-btn b" data-act="buy" title="Buy (B)">B</button><button class="mini-btn s" data-act="sell" title="Sell (S)">S</button>'}
@@ -1687,24 +1705,34 @@ function paintLevel(lv) {
     // Multi-lot controls only for F&O positions of 2+ lots; everything else keeps the single-line TP/SL.
     const multi = isDeriv(inst) && Math.abs(t.qty) / unit >= 2;
     const lots = !multi ? '' : pending ? `<span class="lots"><b>${lotsLabel(leg.qty)}</b></span>`
-      : `<span class="lots"><button data-lv="lot-minus" ${leg.qty <= unit ? 'disabled' : ''} title="One lot less">−</button><b>${lotsLabel(leg.qty)}</b><button data-lv="lot-plus" ${lv.free < unit ? 'disabled' : ''} title="${lv.free < unit ? 'All lots already covered on this side' : 'One lot more'}">+</button></span>`;
+      : `<span class="lots"><button class="hov" data-lv="lot-minus" ${leg.qty <= unit ? 'disabled' : ''} title="One lot less">−</button><b>${lotsLabel(leg.qty)}</b><button class="hov" data-lv="lot-plus" ${lv.free < unit ? 'disabled' : ''} title="${lv.free < unit ? 'All lots already covered on this side' : 'One lot more'}">+</button></span>`;
     const split = multi && !pending && legLots >= 2 && Number.isInteger(legLots)
       ? `<button data-lv="split" title="Split this ${legLots}-lot ${label} into several lines">Split</button>` : '';
     const acts = pending ? '' : `${split}<span class="mode" title="${lv.mode === 'gtt' ? 'Kite GTT: stays active at Zerodha' : 'Exit order linked by this app (OCO)'}">${lv.mode.toUpperCase()}</span><button data-lv="cancel" title="Cancel this ${label} (${lotsLabel(leg.qty)})">✕</button>`;
-    html = `<div class="cl-hit"></div><div class="cl-pill" title="Drag to move"><span class="grip">⋮⋮</span><span class="tag">${label}</span>${lots}
-      <span class="px num">${fmt(lv.price, n)}</span><span class="num ${cls(pnl)}">${signed(pnl)} <span class="faint">(${signed(move)}%)</span></span>
+    // Compact by default (tag, lots, price, P&L); the rest of the controls show on hover.
+    html = `<div class="cl-hit"></div><div class="cl-lead"></div><div class="cl-pill" title="Drag to move"><span class="grip hov">⋮⋮</span><span class="tag">${label}</span>${lots}
+      <span class="px num">${fmt(lv.price, n)}</span><span class="num ${cls(pnl)}">${signed(pnl)}<span class="faint hov">&nbsp;(${signed(move)}%)</span></span>
       ${bad ? `<span class="warn">${bad}</span>` : lv.dragging ? '<span class="hint">release to save</span>' : pending ? '<span class="hint">saving…</span>' : ''}
-      <span class="acts">${acts}</span></div>`;
+      ${acts ? `<span class="acts hov">${acts}</span>` : ''}</div>`;
     lv.pl.applyOptions({ price: lv.price, color: cssVar(lv.kind === 'tp' ? '--up' : '--down'),
-      lineStyle: lv.state === 'active' ? 0 : 2, lineWidth: lv.state === 'active' ? 1 : 2, title: multi ? `${label} ${lotsLabel(leg.qty)}` : label });
+      lineStyle: lv.state === 'active' ? 0 : 2, lineWidth: lv.state === 'active' ? 1 : 2, title: '' }); // the pill names it; titles crowd the price axis
   }
   lv.el.className = klass;
   if (lv.html !== html) {
     lv.el.innerHTML = html;
     lv.html = html;
-    const pill = lv.el.querySelector('.cl-pill');
-    if (pill && lv.pillRight && lv.kind !== 'entry') pill.style.right = lv.pillRight;
+    if (lv.kind !== 'entry') placeLabel(lv);
   }
+}
+
+const LABEL_GAP = 28; // px between stacked TP / SL labels
+
+function placeLabel(lv) {
+  const off = lv.labelOff || 0;
+  const pill = lv.el.querySelector('.cl-pill');
+  const lead = lv.el.querySelector('.cl-lead');
+  if (pill) pill.style.top = `${off}px`;
+  if (lead) { lead.style.top = `${Math.min(0, off)}px`; lead.style.height = `${Math.abs(off)}px`; }
 }
 
 function positionLevels() {
@@ -1719,19 +1747,26 @@ function positionLevels() {
     lv.el.style.transform = `translateY(${y}px)`;
     if (lv.kind !== 'entry') right.push({ lv, y });
   }
-  // TP / SL labels whose lines are close together step sideways instead of overlapping.
-  const sig = right.map((r) => `${r.lv.id}:${Math.round(r.y / 4)}:${r.lv.html?.length}`).join('|');
+  // TP / SL labels whose lines are close together stack vertically by the price axis
+  // (a short leader ties each to its line) instead of spreading over the candles.
+  const sig = right.map((r) => `${r.lv.id}:${Math.round(r.y)}`).join('|');
   if (sig === positionLevels.sig) return;
   positionLevels.sig = sig;
-  const width = Math.max(0, ...right.map((r) => r.lv.el.querySelector('.cl-pill')?.offsetWidth || 0));
-  const cols = [];
+  const groups = [];
   for (const r of right.sort((a, b) => a.y - b.y)) {
-    let col = 0;
-    while (cols[col] != null && r.y - cols[col] < 32) col++;
-    cols[col] = r.y;
-    r.lv.pillRight = `${12 + col * (width + 8)}px`;
-    const pill = r.lv.el.querySelector('.cl-pill');
-    if (pill) pill.style.right = r.lv.pillRight;
+    groups.push({ items: [r], sum: r.y });
+    // Merge while the newest group overlaps the one above it; each group is centred on its lines.
+    while (groups.length > 1) {
+      const g = groups[groups.length - 1];
+      const prev = groups[groups.length - 2];
+      const top = (x) => x.sum / x.items.length - ((x.items.length - 1) * LABEL_GAP) / 2;
+      if (top(prev) + prev.items.length * LABEL_GAP <= top(g)) break;
+      prev.items.push(...g.items); prev.sum += g.sum; groups.pop();
+    }
+  }
+  for (const g of groups) {
+    const top = g.sum / g.items.length - ((g.items.length - 1) * LABEL_GAP) / 2;
+    g.items.forEach((r, k) => { r.lv.labelOff = top + k * LABEL_GAP - r.y; placeLabel(r.lv); });
   }
 }
 
@@ -1907,16 +1942,19 @@ function normalizeEdits(product) {
   if (c.edits[product] && legsEqual(c.edits[product], serverLegs(product))) delete c.edits[product];
 }
 
-function startLevelDrag(lv) {
+function startLevelDrag(lv, down) {
   const c = S.chart;
   const rect = $('#chart').getBoundingClientRect();
   const product = lv.t.product;
   const id = lv.leg.id;
   lv.dragging = true;
+  // Relative to where the drag started: a label stacked off its line must not make the line jump.
+  const startY = c.series.priceToCoordinate(lv.price);
+  const grab = startY == null ? 0 : down.clientY - rect.top - startY;
   c.api.applyOptions({ handleScroll: false, handleScale: false });
   c.api.priceScale('right').applyOptions({ autoScale: false }); // keep the axis still under the cursor
   const move = (ev) => {
-    const p = c.series.coordinateToPrice(ev.clientY - rect.top);
+    const p = c.series.coordinateToPrice(ev.clientY - rect.top - grab);
     if (p == null || p <= 0) return;
     const leg = draftLegs(product)[sideKey(lv.kind)].find((l) => l.id === id);
     if (leg) leg.price = roundTick(p);
@@ -2382,6 +2420,7 @@ async function openOrder(partial, side, opts = {}) {
               ${modify ? '' : '<div class="field"><label for="o-tag">Tag <em>optional</em></label><input class="input" id="o-tag" name="tag" maxlength="20" style="font-family:var(--font)"></div>'}
             </div>
           </div>
+          <div class="form-note hidden" id="o-stop-note"></div>
           <div class="form-error hidden" id="o-err"></div>
         </div>
         <div class="order-side"><h4>Market depth</h4><div id="o-depth">${depthHTML(S.quotes[inst.key], inst, true)}</div></div>
@@ -2400,8 +2439,22 @@ async function openOrder(partial, side, opts = {}) {
     p.disabled = t === 'MARKET' || t === 'SL-M';
     tr.disabled = t === 'MARKET' || t === 'LIMIT';
     if (!p.disabled && !p.value) { const l = S.quotes[inst.key]?.last_price; const tk = inst.tick_size || 0.05; if (l) p.value = (Math.round(l / tk) * tk).toFixed(n); }
+    stopNote();
     if (deriv && !qtyInLots(inst)) $('#o-qty-hint').textContent = `${lot * (+f.elements.qty.value || 0)} qty (${+f.elements.qty.value || 0} × ${lot})`;
   };
+  // Mirrors the server (limit_as_stop in app.py): a limit through the market goes as a stop-limit.
+  const stopNote = () => {
+    const el = $('#o-stop-note');
+    const l = S.quotes[inst.key]?.last_price;
+    const px = parseFloat(f.elements.price.value);
+    const buy = S.order?.side === 'BUY';
+    const v = f.querySelector('input[name=variety]:checked')?.value;
+    const val = f.querySelector('input[name=validity]:checked')?.value || 'DAY';
+    const on = f.elements.order_type.value === 'LIMIT' && v === 'regular' && val === 'DAY' && l && px > l && buy;
+    el.classList.toggle('hidden', !on);
+    if (on) el.textContent = `Above LTP: sent as a stop-limit — buys only once the price rises to ${(+px).toFixed(n)} (trigger = limit = ${(+px).toFixed(n)}).`;
+  };
+  S.order.stopNote = stopNote;
   const resetConfirm = () => {
     if (!S.order?.confirming) return;
     S.order.confirming = false;
@@ -2433,7 +2486,7 @@ async function openOrder(partial, side, opts = {}) {
     S.order.side = S.order.side === 'BUY' ? 'SELL' : 'BUY';
     f.classList.toggle('sell', S.order.side === 'SELL');
     $('#o-side').classList.toggle('on', S.order.side === 'SELL');
-    resetConfirm(); setSubmitLabel(); fetchMargin();
+    resetConfirm(); setSubmitLabel(); fetchMargin(); syncFields();
   });
   $('#o-depth').addEventListener('click', (e) => {
     const tr = e.target.closest('tr[data-price]');
@@ -2514,11 +2567,12 @@ async function submitOrder() {
   btn.disabled = true; btn.textContent = o.mode === 'modify' ? 'Modifying…' : 'Placing…';
   try {
     if (o.mode === 'modify') {
-      await api(`/orders/${o.order.variety}/${o.order.order_id}`, { method: 'PUT', body: p });
-      toast('success', 'Modification sent', `${p.tradingsymbol} · #${o.order.order_id}`);
+      const r = await api(`/orders/${o.order.variety}/${o.order.order_id}`, { method: 'PUT', body: p });
+      toast('success', r?.as_stop ? 'Modified to a stop-limit' : 'Modification sent', `${p.tradingsymbol} · #${o.order.order_id}${r?.as_stop ? ` · triggers at ${fmt(p.price)} (LTP ${fmt(r.ltp)})` : ''}`);
     } else {
       const r = await api(`/orders/${p.variety}`, { method: 'POST', body: p });
-      toast('success', `${p.transaction_type} order placed`, `${p.tradingsymbol} · ${p.quantity} qty · #${r.order_id}`);
+      toast('success', r.as_stop ? `Stop-limit ${p.transaction_type.toLowerCase()} placed` : `${p.transaction_type} order placed`,
+        `${p.tradingsymbol} · ${p.quantity} qty · #${r.order_id}${r.as_stop ? ` · triggers at ${fmt(p.price)} (LTP ${fmt(r.ltp)})` : ''}`);
     }
     topModal()?._close();
     loadOrders().catch(() => {});
@@ -2564,6 +2618,7 @@ function updateOrderQuote() {
   const c = chg(q);
   el.innerHTML = `LTP <span class="num">${fmt(c.ltp, dp(o.inst))}</span> · <span class="num">${signed(c.ch)} (${pct(c.p)})</span>${isDeriv(o.inst) ? ` · Lot ${o.inst.lot_size}` : ''}`;
   $('#o-depth').innerHTML = depthHTML(q, o.inst, true);
+  o.stopNote?.();
 }
 
 /* ============================================================= user menu */
@@ -2722,7 +2777,7 @@ function bindEvents() {
     e.preventDefault();
     const btn = e.target.closest('[data-lv]');
     if (btn) levelAction(lv, btn.dataset.lv);
-    else if (lv.kind !== 'entry') startLevelDrag(lv);
+    else if (lv.kind !== 'entry') startLevelDrag(lv, e);
   });
 
   let gAt = 0;

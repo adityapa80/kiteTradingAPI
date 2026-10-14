@@ -211,11 +211,36 @@ protections = ProtectionManager(kite, instruments, None if MOCK else DATA_DIR / 
 protections.start()
 
 
+_sync_state = {"running": False, "again": False}
+_sync_lock = threading.Lock()
+
+
 def _sync_protections(_order=None):
+    """React to fills immediately instead of on the next 3 s sweep. Kite sends several
+    postbacks per order; while a sync is running, further ones just ask for one more pass,
+    so a burst of orders can't pile up Kite calls and hit the rate limit (which stalls
+    order placement for a second)."""
+    with _sync_lock:
+        if _sync_state["running"]:
+            _sync_state["again"] = True
+            return
+        _sync_state["running"] = True
     try:
-        protections.sync()  # react to fills immediately instead of on the next 3 s sweep
-    except KiteError as exc:
-        print("protection sync:", exc.message)
+        while True:
+            with _sync_lock:
+                _sync_state["again"] = False
+            try:
+                protections.sync()
+            except KiteError as exc:
+                print("protection sync:", exc.message)
+            with _sync_lock:
+                if not _sync_state["again"]:
+                    _sync_state["running"] = False
+                    return
+    except BaseException:
+        with _sync_lock:
+            _sync_state["running"] = False
+        raise
 
 
 def _key_to_token(key):
@@ -347,6 +372,22 @@ def trades():
     return jsonify(kite.trades())
 
 
+def limit_as_stop(params, exchange, symbol, side):
+    """A buy LIMIT above the market would fill at once at the market price. Send it as a
+    stop-limit instead (trigger = limit = the chosen price), so it only buys once the price
+    rises to it. Sells are left alone: a sell limit below the market is often a quick exit."""
+    if side != "BUY" or params.get("order_type") != "LIMIT" or params.get("validity", "DAY") != "DAY" \
+            or not params.get("price"):
+        return None
+    key = f"{exchange}:{symbol}"
+    ltp = kite.ltp([key]).get(key, {}).get("last_price")
+    price = float(params["price"])
+    if not ltp or price <= ltp:
+        return None
+    params.update(order_type="SL", trigger_price=price)
+    return ltp
+
+
 @app.post("/api/orders/<variety>")
 @require_login
 def place_order(variety):
@@ -354,7 +395,10 @@ def place_order(variety):
         return jsonify(error="Invalid variety", error_type="InputException"), 400
     params = clean_order_params(request.get_json(force=True))
     check_lot_multiple(params.get("exchange"), params.get("tradingsymbol"), params.get("quantity", 0))
-    return jsonify(kite.place_order(variety, params))
+    ltp = limit_as_stop(params, params.get("exchange"), params.get("tradingsymbol"),
+                        params.get("transaction_type")) if variety == "regular" else None
+    res = kite.place_order(variety, params)
+    return jsonify({**res, "as_stop": ltp is not None, "ltp": ltp})
 
 
 @app.put("/api/orders/<variety>/<order_id>")
@@ -365,7 +409,13 @@ def modify_order(variety, order_id):
                                        "validity", "disclosed_quantity"))
     if "quantity" in params:
         check_lot_multiple(body.get("exchange"), body.get("tradingsymbol"), params["quantity"])
-    return jsonify(kite.modify_order(variety, order_id, params))
+    ltp = None
+    if variety == "regular" and params.get("order_type") == "LIMIT":
+        order = next((o for o in kite.orders() if o["order_id"] == order_id), None)
+        if order and order.get("tag") not in ("ktTP", "ktSL"):  # TP/SL exit legs are managed by protect.py
+            ltp = limit_as_stop(params, order["exchange"], order["tradingsymbol"], order["transaction_type"])
+    res = kite.modify_order(variety, order_id, params)
+    return jsonify({**(res or {}), "as_stop": ltp is not None, "ltp": ltp})
 
 
 @app.delete("/api/orders/<variety>/<order_id>")

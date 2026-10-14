@@ -269,6 +269,7 @@ kbd {
 .wl-sym { flex: 1; min-width: 0; }
 .wl-sym .sym { font-weight: 600; font-size: 13.5px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; display: block; }
 .wl-sym .sub { font-size: 11px; color: var(--faint); }
+.wl-sym .sub.warn { color: var(--warn); cursor: help; }
 .wl-px { text-align: right; }
 .wl-px .ltp { display: block; font-size: 13.5px; font-weight: 600; border-radius: 4px; padding: 0 3px; margin-right: -3px; transition: background .5s; }
 .wl-px .chg { font-size: 11.5px; }
@@ -476,6 +477,14 @@ kbd {
   border: 1px solid var(--lc); box-shadow: 0 6px 18px -6px rgba(0, 0, 0, .45); pointer-events: auto;
   white-space: nowrap; cursor: ns-resize; user-select: none; touch-action: none;
 }
+.cl:hover, .cl.dragging { z-index: 2; }
+.cl-lead { position: absolute; right: 10px; width: 1px; background: var(--lc); opacity: .7; pointer-events: none; }
+.cl:not(.entry) .cl-pill { height: 24px; gap: 6px; padding: 0 6px 0 3px; border-radius: 7px; font-size: 11.5px; }
+.cl:not(.entry) .cl-pill .tag { height: 18px; padding: 0 6px; }
+.cl:not(.entry) .cl-pill .lots, .cl:not(.entry) .cl-pill .lots button { height: 18px; }
+.cl:not(.entry) .cl-pill button { height: 18px; }
+.cl .cl-pill .hov { display: none; }
+.cl:hover .cl-pill .hov, .cl.dragging .cl-pill .hov { display: inline-flex; }
 .cl.entry .cl-pill { right: auto; left: 12px; cursor: default; padding-left: 4px; }
 .cl.draft .cl-pill, .cl.dirty .cl-pill { border-style: dashed; }
 .cl.dragging .cl-pill { box-shadow: 0 0 0 3px color-mix(in srgb, var(--lc) 25%, transparent), 0 8px 20px -6px rgba(0, 0, 0, .5); }
@@ -664,6 +673,7 @@ table.oc tbody tr:hover .oc-acts { display: inline-flex; }
 .more-toggle:hover { color: var(--text); }
 .more-toggle svg.i { width: 14px; height: 14px; transition: transform .15s; }
 .more-toggle.open svg.i { transform: rotate(180deg); }
+.form-note { padding: 9px 12px; border-radius: 8px; background: var(--accent-soft); color: var(--accent); font-size: 12.5px; }
 .form-error { padding: 9px 12px; border-radius: 8px; background: var(--down-soft); color: var(--down); font-size: 12.5px; }
 .order-foot {
   display: flex; align-items: center; gap: 12px; padding: 14px 20px; border-top: 1px solid var(--border); background: var(--panel-2);

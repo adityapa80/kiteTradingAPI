@@ -77,6 +77,7 @@ class _Client:
         self.dirty = set()
         self.orders = False
         self.status = True  # send status on first loop
+        self.closed = False
         self.event = threading.Event()
 
 
@@ -97,9 +98,18 @@ class TickHub:
 
     # ----------------------------------------------------------- browser side
     def register(self, cid):
+        """Each connection gets its own client. A browser that reconnects (network blip)
+        reuses its cid: the old, probably dead connection is told to stop, so it can't
+        swallow ticks meant for the new one or unregister it when it finally errors out."""
         with self.lock:
-            self.clients[cid] = self.clients.get(cid) or _Client()
-            return self.clients[cid]
+            old = self.clients.get(cid)
+            client = self.clients[cid] = _Client()
+            if old:
+                old.closed = True
+                old.event.set()
+                client.keys, client.depth_keys = old.keys, old.depth_keys
+                client.dirty = {k for k in client.keys if k in self.latest}
+            return client
 
     def unregister(self, cid, client):
         with self.lock:
@@ -123,10 +133,12 @@ class TickHub:
         client = self.register(cid)
         try:
             yield "retry: 2000\n\n"
-            while True:
+            while not client.closed:
                 if not client.event.wait(15):
-                    yield ": ping\n\n"
+                    yield "event: ping\ndata: {}\n\n"  # an event, not a comment: the browser's watchdog sees it
                     continue
+                if client.closed:
+                    break
                 time.sleep(PUSH_INTERVAL)
                 with self.lock:
                     client.event.clear()

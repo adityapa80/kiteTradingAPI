@@ -30,6 +30,9 @@ class KiteClient:
         self.access_token = access_token
         self.timeout = timeout
         self.http = requests.Session()
+        # Browser polling, the TP/SL watcher and order postbacks call Kite from many threads at
+        # once; a bigger pool keeps their connections warm instead of re-doing TLS over ~40 ms.
+        self.http.mount("https://", requests.adapters.HTTPAdapter(pool_connections=4, pool_maxsize=32))
 
     # ---- plumbing -------------------------------------------------------
     def login_url(self):
@@ -493,6 +496,8 @@ class MockKite:
         g = self.gtt_list.get(int(trigger_id))
         if not g or g["status"] != "active":
             raise KiteError("GTT is not active", "InputException", 400)
+        if trigger_type != g["type"]:  # like Kite: a GTT's type can't be changed by modifying it
+            raise KiteError("GTT type cannot be modified", "InputException", 400)
         g.update(type=trigger_type, condition=dict(condition), orders=[{**o, "result": None} for o in orders])
         return {"trigger_id": g["id"]}
 

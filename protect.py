@@ -274,7 +274,7 @@ class ProtectionManager:
                 try:
                     live.append(self._apply_tranche(o, d, rec, ltp, orders))
                 except Exception:
-                    if o:
+                    if o and (rec["mode"] != "gtt" or o.get("gtt_id")):
                         pool.insert(0, o)
                     raise
             while pool:
@@ -309,18 +309,46 @@ class ProtectionManager:
         except KiteError:
             return True  # unknown: assume active rather than risk a duplicate
 
+    @staticmethod
+    def _gtt_type(t):
+        return "two-leg" if t.get("tp") is not None and t.get("sl") is not None else "single"
+
+    def _replace_gtt(self, o, payload, rec, ltp):
+        try:
+            self.kite.delete_gtt(o["gtt_id"])
+        except KiteError:
+            if self._gtt_active(o["gtt_id"]):
+                raise  # still live: leave it as it is
+        try:
+            return self.kite.place_gtt(*payload)["trigger_id"]
+        except KiteError:
+            try:
+                o["gtt_id"] = self.kite.place_gtt(*self._gtt_payload(rec, o, ltp))["trigger_id"]
+            except KiteError:
+                o["gtt_id"] = None
+                self._event("error", f"A TP/SL on {rec['tradingsymbol']} was removed",
+                            "Its replacement was refused and the old one could not be restored. Set it again.")
+            raise
+
     def _apply_tranche(self, o, d, rec, ltp, orders):
         t = {k: d[k] for k in ("tp_id", "sl_id", "tp", "sl", "qty")}
         if rec["mode"] == "gtt":
             payload = self._gtt_payload(rec, t, ltp)
             if o and o.get("gtt_id"):
-                try:
-                    self.kite.modify_gtt(o["gtt_id"], *payload)
-                    t["gtt_id"] = o["gtt_id"]
+                if self._gtt_type(o) == payload[0]:
+                    try:
+                        self.kite.modify_gtt(o["gtt_id"], *payload)
+                        t["gtt_id"] = o["gtt_id"]
+                        return t
+                    except KiteError:
+                        if self._gtt_active(o["gtt_id"]):
+                            raise  # a real rejection: keep the old GTT rather than replace it
+                else:
+                    # Kite won't turn a single GTT into a two-leg one (or back) by modifying it,
+                    # e.g. adding an SL to an existing TP: replace it. Delete first so both can
+                    # never fire together; if the new one is refused, put the old one back.
+                    t["gtt_id"] = self._replace_gtt(o, payload, rec, ltp)
                     return t
-                except KiteError:
-                    if self._gtt_active(o["gtt_id"]):
-                        raise  # a real rejection: keep the old GTT rather than replace it
             t["gtt_id"] = self.kite.place_gtt(*payload)["trigger_id"]
             return t
 

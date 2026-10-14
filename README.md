@@ -4,7 +4,7 @@ A modern trading web interface for Zerodha, built on the [Kite Connect v3 API](h
 
 - **Real-time prices**: a Kite WebSocket feed is streamed to the browser (watchlist, option chain, depth, P&L, candles). Fills arrive instantly through order postbacks. A **LIVE** badge shows the feed status
 - **Watchlists**: 5 lists, tick-by-tick prices with flashes, inline market depth, instrument search across NSE/BSE/NFO/MCX
-- **Order window**: Buy/Sell toggle, Regular/AMO, MIS/CNC/NRML, Market/Limit/SL/SL-M, lots for F&O, live margin requirement, click-to-fill depth, optional confirmation step
+- **Order window**: Buy/Sell toggle, Regular/AMO, MIS/CNC/NRML, Market/Limit/SL/SL-M, lots for F&O, live margin requirement, click-to-fill depth, optional confirmation step. A regular DAY **buy limit above the last price** is sent as a stop-limit (trigger = limit = your price), so it waits for the price to rise to it instead of filling at once at market
 - **Orders**: pending, executed, and trades, with modify, cancel, and repeat; toasts when orders fill or get rejected
 - **Positions and holdings**: live P&L, one-click exit, allocation breakdown, sortable columns
 - **Charts**: candlesticks and volume (TradingView Lightweight Charts) from 1m to 1D, updating live
@@ -77,6 +77,7 @@ is checked against the lot size, both in the browser and on the server, before i
 | MIS (intraday) | Two regular exit orders (a target LIMIT plus an SL stop) that this app links as an OCO pair | **No**, the app must stay running |
 
 - **Multiple lots**: TP and SL lines are paired lot by lot into *tranches*, nearest target with farthest stop, and each tranche is its own OCO (one GTT, or one order pair for MIS). With TP 1L @ x, TP 2L @ y and SL 3L @ z, hitting x exits 1 lot and leaves an OCO covering exactly the remaining 2 lots at y and z. The stop never covers more than you hold. If the position shrinks some other way, the lines farthest from the market are trimmed first.
+- **Adding or removing the other side**: Kite can't change a GTT between single and two-leg by modifying it, so when a tranche gains or loses its SL/TP its GTT is deleted and a new one placed (the old one is put back if the new one is refused).
 - **Limit buffers**: SL legs use a limit price 1% beyond the trigger (`SL_LIMIT_BUFFER`). GTT target legs use a limit 0.5% inside the target (`TP_LIMIT_BUFFER`). These are floors, not fixed prices, so orders still fill on spikes that reverse instantly. Both settings are in `protect.py`.
 - **MIS watcher**: every 3 seconds, a background watcher (`protect.py`) checks the MIS legs. When one leg fills, it cancels the other. If you partly exit, it resizes the legs to the remaining quantity. If you close the position some other way, it cancels both legs.
 - **Records**: TP/SL records are stored in `data/protections.json`, and chart drawings in `data/drawings.json`.
