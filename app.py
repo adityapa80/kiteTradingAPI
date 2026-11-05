@@ -212,6 +212,11 @@ protections = ProtectionManager(kite, instruments, None if MOCK else DATA_DIR / 
 protections.start()
 tradelog = TradeLog(kite, DATA_DIR / "trades", "zerodha", instruments.get)
 if not MOCK:
+    try:
+        tradelog.record_plans(protections.items)  # the TP/SL already in place at start
+    except Exception as exc:
+        print(f"  ! trade log: {exc}")
+    protections.on_change = tradelog.record_plans
     tradelog.start()
 
 
