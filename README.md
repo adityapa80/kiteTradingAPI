@@ -94,10 +94,28 @@ is checked against the lot size, both in the browser and on the server, before i
 - **WebSocket limits**: Kite allows 3 WebSocket connections per API key and 3000 instruments per connection.
   The app uses one connection.
 
+## Trade log and points vs P&L report
+
+The broker API only returns today's trades, so the app saves each day's fills to
+`data/trades/YYYY-MM-DD.json` every 5 minutes while you are logged in (and once more at
+logout). `tradereport.py` turns them into flat-to-flat trades and, per day, compares the
+points caught with the money made:
+
+```bash
+python tradereport.py --trades                # every day, with each trade listed
+python tradereport.py --from 2026-11-01 --csv trades.csv
+```
+
+It shows gross P&L, estimated charges (rates at the top of the file), net P&L, and the
+"same-size P&L": what the day would have made with every trade at that day's average
+size. The difference is the sizing effect, and each day gets a verdict: sizing, charges,
+or strategy (lost points).
+
 ## Files
 
 | File | Purpose |
 | --- | --- |
 | `app.py` | Flask server: OAuth login, REST proxy, instrument search, session persistence |
 | `kite.py` | Lightweight Kite Connect client and the demo-mode mock |
+| `tradelog.py`, `tradereport.py` | Daily fills log and the points vs P&L report |
 | `static/index.html`, `style.css`, `app.js` | The UI (vanilla JS, no build step) |

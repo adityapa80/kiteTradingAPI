@@ -19,6 +19,7 @@ from kite import KiteClient, KiteError, MockKite
 from net import force_ipv4
 from protect import ProtectionManager
 from stream import MockTickHub, TickHub
+from tradelog import TradeLog
 
 load_dotenv()
 if os.getenv("KITE_FORCE_IPV4", "1") == "1":
@@ -209,6 +210,9 @@ def check_lot_multiple(exchange, symbol, quantity):
 instruments = InstrumentStore()
 protections = ProtectionManager(kite, instruments, None if MOCK else DATA_DIR / "protections.json")
 protections.start()
+tradelog = TradeLog(kite, DATA_DIR / "trades", "zerodha", instruments.get)
+if not MOCK:
+    tradelog.start()
 
 
 _sync_state = {"running": False, "again": False}
@@ -317,6 +321,11 @@ def callback():
 @app.post("/api/logout")
 @require_login
 def logout():
+    if not MOCK:
+        try:
+            tradelog.save(date.today().isoformat())  # keep today's fills before the session ends
+        except Exception:
+            pass
     try:
         kite.invalidate_session()
     finally:
